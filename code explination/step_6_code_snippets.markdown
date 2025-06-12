@@ -1,113 +1,116 @@
-# Step 6: Search and Retrieval - Code Snippets with Explanations
+# Step 6: Retrieval and Presentation - Code Snippets with Explanations
 
-## Snippet 1: Web App Setup
+## Snippet 1: Search Whoosh Index
 **Code**:
 ```python
-app = Flask(__name__)
-@app.route('/')
-def index():
-    conn = get_db_connection('howl_metadata.db')
+def search_index(query_str, limit=10):
+    try:
+        ix = open_dir('whoosh_index')
+        with ix.searcher() as searcher:
+            query = MultifieldParser(['content'], ix.schema).parse(query_str)
+            results = searcher.search(query, limit=limit)
+            hits = [
+                {
+                    'id': hit['id'],
+                    'type': hit['type'],
+                    'content': hit['content'],
+                    'timestamp': hit['timestamp'],
+                    'keyframe_num': hit.get('keyframe_num', -1),
+                    'scene_label': hit.get('scene_label', -1)
+                }
+                for hit in results
+            ]
+            retrieval_logger.info(f"Search query '{query_str}' returned {len(hits)} results")
+            return hits
+    except Exception as e:
+        retrieval_logger.error(f"Search failed: {str(e)}")
+        return []
+```
+
+**Explanation**:
+This code’s like a treasure hunter! It searches the Whoosh index for words in transcripts or keywords, like finding movie scenes matching a query. It digs up the best matches for users!
+
+## Snippet 2: Fetch Metadata from SQLite
+**Code**:
+```python
+def fetch_metadata(keyframe_num=None, scene_label=None):
+    conn = get_db_connection()
+    if not conn:
+        return {}
     cursor = conn.cursor()
-    cursor.execute('SELECT scene_id, start_time, end_time, summary FROM scenes ORDER BY start_time')
-    chapters = [
-        {
-            'scene_id': row['scene_id'],
-            'start_time': row['start_time'],
-            'end_time': row['end_time'],
-            'summary': row['summary']
-        }
-        for row in cursor.fetchall()
-    ]
+    metadata = {}
+    if keyframe_num is not None:
+        cursor.execute('SELECT * FROM keyframes WHERE keyframe_num = ?', (keyframe_num,))
+        kf = cursor.fetchone()
+        if kf:
+            metadata['keyframe'] = {
+                'keyframe_num': kf['keyframe_num'],
+                'timestamp': kf['timestamp'],
+                'transcript': kf['transcript'],
+                'keywords': json.loads(kf['keywords'])
+            }
     conn.close()
-    return render_template('index.html', chapters=chapters)
+    return metadata
 ```
 
 **Explanation**:
-This code’s like a tour guide setting up a welcome desk! It uses Flask to create a web page showing video chapters (scenes) from the SQLite database. It’s the front door to our video search, inviting users to explore!
+This code’s like a librarian! It grabs details like transcripts or keywords from the SQLite database, like pulling a book of movie facts for a specific scene. It fills in the search results with rich info!
 
-## Snippet 2: Metadata Search
+## Snippet 3: Generate Recommendations
 **Code**:
 ```python
-def search_index(index_dir, query_str, filter_sentiment=None, time_range=None, limit=10):
-    ix = open_dir(index_dir)
-    with ix.searcher(weighting=scoring.TF_IDF()) as searcher:
-        query = MultifieldParser(
-            ['keywords', 'transcript', 'scene_summary', 'event_description'],
-            schema=ix.schema
-        ).parse(query_str)
-        results = searcher.search(query, limit=10)
-        filtered_results = []
-        for hit in results:
-            if filter_sentiment and hit['sentiment'].lower() != filter_sentiment.lower():
-                continue
-            if time_range and not (time_range[0] <= hit['timestamp'] <= time_range[1]):
-                continue
-            filtered_results.append({
-                'keyframe_num': hit['keyframe_num'],
-                'timestamp': hit['timestamp'],
-                'keywords': hit['keywords'].split(',')
-            })
-        return filtered_results
-```
-
-**Explanation**:
-This code’s like a super-smart librarian! It searches the Whoosh index for queries like “Sophie Howl,” filtering by mood or time, and ranks results with TF-IDF. It finds the best video moments in a snap!
-
-## Snippet 3: Recommendations
-**Code**:
-```python
-def get_recommendations(metadata, keyframe_num, top_n=3):
-    documents = []
-    keyframe_indices = []
-    for kf in metadata['descriptive']['keyframes']:
-        text = ' '.join(kf['keywords']) + ' ' + kf['transcript']
-        documents.append(text)
-        keyframe_indices.append(kf['keyframe_num'])
+def get_recommendations(item_id, item_type, limit=3):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    items = []
+    if item_type == 'keyframe':
+        cursor.execute('SELECT keyframe_num, transcript, keywords FROM keyframes')
+        items = [
+            {'id': f"keyframe_{row['keyframe_num']}", 'content': ' '.join([row['transcript'], ' '.join(json.loads(row['keywords']))])}
+            for row in cursor.fetchall()
+        ]
+    texts = [item['content'] for item in items]
     vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(documents)
-    target_idx = keyframe_indices.index(keyframe_num)
-    similarities = cosine_similarity(tfidf_matrix[target_idx:target_idx+1], tfidf_matrix).flatten()
-    indices = np.argsort(similarities)[-top_n-1:-1][::-1]
-    recommendations = [
-        {'keyframe_num': keyframe_indices[i]}
-        for i in indices if i != target_idx
-    ]
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    target_idx = next(i for i, item in enumerate(items) if item['id'] == item_id)
+    similarities = cosine_similarity(tfidf_matrix[target_idx], tfidf_matrix).flatten()
+    similar_indices = similarities.argsort()[-limit-1:-1][::-1]
+    recommendations = [{'id': items[i]['id']} for i in similar_indices]
+    conn.close()
     return recommendations
 ```
 
 **Explanation**:
-This code’s like a movie buddy suggesting similar scenes! It uses TF-IDF and cosine similarity to find keyframes close to the one you’re viewing, like recommending more “Howl” dialogues. It’s a discovery booster!
+This code’s like a movie matchmaker! It uses TF-IDF and cosine similarity to suggest similar keyframes or scenes, like recommending films based on a favorite scene. It keeps users exploring!
 
-## Snippet 4: HTML Templates
+## Snippet 4: Handle Search Requests
 **Code**:
 ```python
-with open(os.path.join(templates_dir, 'index.html'), 'w') as f:
-    f.write('''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Howl's Moving Castle - Search and Retrieval</title>
-</head>
-<body>
-    <h1>Howl's Moving Castle - Search and Retrieval</h1>
-    <div class="search-form">
-        <form action="/search" method="post">
-            <input type="text" name="query" placeholder="Enter keywords (e.g., Sophie Howl)">
-            <input type="submit" value="Search">
-        </form>
-    </div>
-    <h2>Chapters</h2>
-    {% for chapter in chapters %}
-        <div class="chapter">
-            <a href="/search?query={{ chapter.summary | urlencode }}">
-                Scene {{ chapter.scene_id }}: {{ chapter.summary }}
-            </a>
-        </div>
-    {% endfor %}
-</body>
-</html>
-    ''')
+@app.route('/search', methods=['GET', 'POST'])
+def search():
+    if request.method == 'POST':
+        query = request.form.get('query', '').strip()
+        if not query:
+            return render_template('results.html', results=[], recommendations={}, query=query)
+        results = search_index(query)
+        results_with_metadata = []
+        recommendations = {}
+        for result in results:
+            metadata = fetch_metadata(
+                keyframe_num=result['keyframe_num'] if result['type'] in ['keyframe', 'event'] else None,
+                scene_label=result['scene_label'] if result['type'] == 'scene' else None
+            )
+            results_with_metadata.append({
+                'id': result['id'],
+                'type': result['type'],
+                'content': result['content'],
+                'timestamp': result['timestamp'],
+                'metadata': metadata
+            })
+            recommendations[result['id']] = get_recommendations(result['id'], result['type'])
+        return render_template('results.html', results=results_with_metadata, recommendations=recommendations, query=query)
+    return render_template('results.html', results=[], recommendations={}, query='')
 ```
 
 **Explanation**:
-This code’s like a webpage decorator! It creates an HTML template for the Flask app, showing a search bar and clickable chapters. It’s the pretty face of our app, making video browsing fun and easy!
+This code’s like a tour guide! It handles search queries in the Flask app, fetching results, metadata, and recommendations, then displaying them, like guiding users through a movie’s highlights. It makes searching fun and interactive!

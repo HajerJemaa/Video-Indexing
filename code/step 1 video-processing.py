@@ -74,6 +74,7 @@ def extract_frames(video_path, frame_folder, fps_target=1, resize_dim=(640, 360)
             timestamp = frame_num / fps
             frame_metadata.append({
                 'frame_num': saved_frame_num,
+                'original_frame_num': frame_num,
                 'timestamp': timestamp,
                 'path': frame_path
             })
@@ -90,89 +91,62 @@ def extract_frames(video_path, frame_folder, fps_target=1, resize_dim=(640, 360)
     step1_logger.info(f"Extracted {saved_frame_num} frames at {fps_target} FPS in '{frame_folder}'")
     return frame_metadata
 
-def extract_audio_energy(audio_path, hop_length=512):
+def extract_keyframes_from_frames(frame_folder, keyframe_folder, resize_dim=(640, 360)):
     """
-    Extract audio energy to detect significant changes using soundfile.
-    Returns: List of energy values or None if failed.
-    """
-    try:
-        # Use soundfile to load audio
-        y, sr = sf.read(audio_path)
-        # Compute short-time energy
-        energy = np.array([
-            np.sum(np.abs(y[i:i+hop_length]**2))
-            for i in range(0, len(y), hop_length)
-        ])
-        step1_logger.info(f"Extracted audio energy from {audio_path} with sample rate {sr}")
-        return energy
-    except Exception as e:
-        step1_logger.warning(f"Failed to extract audio energy from {audio_path}: {str(e)}. Proceeding without audio cues.")
-        return None
-
-def extract_keyframes(video_path, keyframe_folder, audio_path=None, resize_dim=(640, 360)):
-    """
-    Extract keyframes using visual (HSV histogram) and optional audio (energy) cues.
+    Extract keyframes from already extracted frames using HSV histogram differences.
     Saves timestamps in a JSON file.
     Returns: List of keyframe metadata.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        step1_logger.error(f"Cannot open video {video_path}")
+    # Load frame metadata
+    metadata_path = os.path.join(frame_folder, 'frame_metadata.json')
+    if not os.path.exists(metadata_path):
+        step1_logger.error(f"Frame metadata not found: {metadata_path}")
         return []
     
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            frame_metadata = json.load(f)
+        step1_logger.info(f"Loaded {len(frame_metadata)} frames from {metadata_path}")
+    except Exception as e:
+        step1_logger.error(f"Failed to load frame metadata: {str(e)}")
+        return []
     
-    # Extract audio energy if provided
-    audio_energy = extract_audio_energy(audio_path) if audio_path else None
-    energy_per_frame = None
-    energy_threshold = 0
-    if audio_energy is not None:
-        # Normalize energy to match frame rate
-        energy_per_frame = np.interp(
-            np.arange(0, total_frames) * (len(audio_energy) / total_frames),
-            np.arange(len(audio_energy)),
-            audio_energy
-        )
-        # Compute energy differences
-        energy_diff = np.diff(energy_per_frame, prepend=energy_per_frame[0])
-        energy_threshold = np.percentile(energy_diff, 90)  # Top 10% changes
-        step1_logger.info(f"Audio energy threshold set to {energy_threshold:.4f}")
-    else:
-        step1_logger.info("No audio energy data available; using visual histograms only")
+    if not frame_metadata:
+        step1_logger.error("No frames available for keyframe extraction")
+        return []
     
-    # Compute dynamic histogram threshold
+    # Compute histogram differences
     hist_diffs = []
     prev_hist = None
-    frame_num = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    for frame_info in frame_metadata:
+        frame_path = frame_info['path']
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            step1_logger.warning(f"Cannot read frame {frame_path}")
+            continue
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1, 2], None, [64, 64, 64], [0, 180, 0, 256, 0, 256])
         if prev_hist is not None:
             diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
             hist_diffs.append(diff)
         prev_hist = hist
-        frame_num += 1
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video
     
-    hist_threshold = np.percentile(hist_diffs, 80) if hist_diffs else 0.3
+    # Set stricter threshold (90th percentile)
+    hist_threshold = np.percentile(hist_diffs, 90) if hist_diffs else 0.3
     step1_logger.info(f"Histogram threshold set to {hist_threshold:.4f}")
     
     # Extract keyframes
     Path(keyframe_folder).mkdir(exist_ok=True)
     keyframe_metadata = []
     prev_hist = None
-    frame_num = 0
     saved_keyframe_num = 0
     
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    for frame_info in frame_metadata:
+        frame_path = frame_info['path']
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            step1_logger.warning(f"Cannot read frame {frame_path}")
+            continue
         
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1, 2], None, [64, 64, 64], [0, 180, 0, 256, 0, 256])
@@ -184,32 +158,24 @@ def extract_keyframes(video_path, keyframe_folder, audio_path=None, resize_dim=(
             hist_diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
             if hist_diff > hist_threshold:
                 is_keyframe = True
-            if audio_energy is not None and frame_num < len(energy_diff):
-                if energy_diff[frame_num] > energy_threshold:
-                    is_keyframe = True
-                    step1_logger.info(f"Audio-triggered keyframe at frame {frame_num} (t={frame_num/fps:.2f}s)")
         
         if is_keyframe:
-            # Resize frame
-            frame = cv2.resize(frame, resize_dim, interpolation=cv2.INTER_AREA)
-            # Save keyframe
+            # Copy frame as keyframe
             keyframe_path = os.path.join(keyframe_folder, f"keyframe_{saved_keyframe_num}.jpg")
             cv2.imwrite(keyframe_path, frame)
             # Store metadata
-            timestamp = frame_num / fps
             keyframe_metadata.append({
                 'keyframe_num': saved_keyframe_num,
-                'frame_num': frame_num,
-                'timestamp': timestamp,
+                'frame_num': frame_info['frame_num'],
+                'original_frame_num': frame_info['original_frame_num'],
+                'timestamp': frame_info['timestamp'],
                 'path': keyframe_path
             })
-            step1_logger.info(f"Saved keyframe {saved_keyframe_num} at frame {frame_num} (t={timestamp:.2f}s)")
+            step1_logger.info(f"Saved keyframe {saved_keyframe_num} from frame {frame_info['frame_num']} (t={frame_info['timestamp']:.2f}s)")
             saved_keyframe_num += 1
         
         prev_hist = hist
-        frame_num += 1
     
-    cap.release()
     # Save metadata
     metadata_path = os.path.join(keyframe_folder, 'keyframe_metadata.json')
     with open(metadata_path, 'w', encoding='utf-8') as f:
@@ -220,18 +186,18 @@ def extract_keyframes(video_path, keyframe_folder, audio_path=None, resize_dim=(
 
 if __name__ == "__main__":
     video_path = "howl_scene.mp4"
-    audio_path = "howl_scene_audio.wav"
+    audio_path = "howl_scene_audio_mono.wav"
     frame_folder = "frames"
     keyframe_folder = "keyframes"
     
-    # Extract audio for multimodal keyframe detection
+    # Extract audio (mono, 16kHz)
     try:
         stream = ffmpeg.input(video_path)
-        stream = ffmpeg.output(stream.audio, audio_path, loglevel='error')
+        stream = ffmpeg.output(stream.audio, audio_path, ar=16000, ac=1, format='wav', loglevel='error')
         ffmpeg.run(stream)
         step1_logger.info(f"Extracted audio to {audio_path}")
     except Exception as e:
-        step1_logger.warning(f"Error extracting audio: {str(e)}. Proceeding without audio cues.")
+        step1_logger.warning(f"Error extracting audio: {str(e)}")
         audio_path = None
     
     # Check and convert video
@@ -247,9 +213,9 @@ if __name__ == "__main__":
         step1_logger.error(f"Frame extraction failed: {str(e)}")
         frame_metadata = []
     
-    # Extract keyframes
+    # Extract keyframes from frames
     try:
-        keyframe_metadata = extract_keyframes(video_path, keyframe_folder, audio_path)
+        keyframe_metadata = extract_keyframes_from_frames(frame_folder, keyframe_folder)
     except Exception as e:
         step1_logger.error(f"Keyframe extraction failed: {str(e)}")
         keyframe_metadata = []
